@@ -23,7 +23,7 @@ jobs:
             asset_name: ai-macos-aarch64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies
         if: matrix.apt_deps != ''
