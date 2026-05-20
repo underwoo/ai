@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[dev-dependencies]
+mockito = "1"
+serial_test = "3"
+
 [[bin]]
 name = "ai"
 path = "src/main.rs"
