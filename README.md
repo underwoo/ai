@@ -41,7 +41,7 @@ Configuration is resolved in this order (later sources override earlier ones):
 
 | Source | Location |
 |--------|----------|
-| Config file | `~/.config/ai/config.toml` |
+| Config file | macOS: `~/Library/Application Support/ai/config.toml`<br>Linux: `~/.config/ai/config.toml` |
 | Environment variables | `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` |
 
 ### Config file
