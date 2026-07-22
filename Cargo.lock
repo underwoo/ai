@@ -19,11 +19,12 @@ dependencies = [
 
 [[package]]
 name = "ai"
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 dependencies = [
  "arboard",
  "clap",
  "dirs",
+ "libc",
  "mockito",
  "serde",
  "serde_json",

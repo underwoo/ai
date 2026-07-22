@@ -314,20 +314,89 @@ fn clean_command(raw: &str) -> String {
 // Clipboard
 // ---------------------------------------------------------------------------
 
+/// Execute a closure with stderr temporarily suppressed.
+/// Used to silence noisy X11/Wayland library errors like "Error: Can't open display".
+#[cfg(unix)]
+fn suppress_stderr<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    use std::os::unix::io::AsRawFd;
+
+    // Open /dev/null for writing
+    let devnull = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .ok();
+
+    // Save current stderr
+    let saved_stderr = unsafe { libc::dup(2) };
+
+    // Redirect stderr to /dev/null
+    if let Some(ref dn) = devnull {
+        unsafe { libc::dup2(dn.as_raw_fd(), 2) };
+    }
+
+    // Execute the closure
+    let result = f();
+
+    // Restore stderr
+    if saved_stderr >= 0 {
+        unsafe { libc::dup2(saved_stderr, 2) };
+        unsafe { libc::close(saved_stderr) };
+    }
+
+    result
+}
+
+/// On non-Unix platforms, no stderr suppression is needed.
+#[cfg(not(unix))]
+fn suppress_stderr<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    f()
+}
+
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    // Try arboard (native X11/Wayland)
-    match arboard::Clipboard::new() {
-        Ok(mut cb) => cb.set_text(text).map_err(|e| e.to_string()),
-        Err(arboard_err) => {
-            // Fall back to common CLI clipboard tools
-            if try_cli_clipboard(text) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "arboard: {}; no fallback tool found (xclip/xsel/wl-copy)",
-                    arboard_err
-                ))
-            }
+    // On Linux, check if a display server is available before trying arboard.
+    // This avoids triggering X11 library initialization which prints errors.
+    // On macOS, arboard uses native Cocoa APIs that don't require DISPLAY.
+    #[cfg(target_os = "linux")]
+    let has_display = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+
+    #[cfg(not(target_os = "linux"))]
+    let has_display = true;
+
+    let mut arboard_error: Option<String> = None;
+
+    if has_display {
+        // Suppress stderr to avoid X11 library noise like "Error: Can't open display"
+        let result = suppress_stderr(|| match arboard::Clipboard::new() {
+            Ok(mut cb) => cb.set_text(text).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        });
+
+        if result.is_ok() {
+            return result;
+        }
+
+        arboard_error = result.err();
+    }
+
+    // Fall back to CLI clipboard tools (also suppress their stderr)
+    if suppress_stderr(|| try_cli_clipboard(text)) {
+        return Ok(());
+    }
+
+    // Build detailed error message for -vvv
+    match arboard_error {
+        Some(e) => Err(format!(
+            "arboard: {}; no fallback tool found (xclip/xsel/wl-copy)",
+            e
+        )),
+        None => {
+            Err("no display available; no fallback tool found (xclip/xsel/wl-copy)".to_string())
         }
     }
 }
@@ -342,6 +411,7 @@ fn try_cli_clipboard(text: &str) -> bool {
         if let Ok(mut child) = std::process::Command::new(cmd)
             .args(*args)
             .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
             use std::io::Write;
