@@ -47,7 +47,37 @@ struct Config {
     model: String,
 }
 
-fn config_file_path() -> PathBuf {
+/// Detect the install prefix by walking up from the binary's location.
+/// Returns the directory that contains `bin/ai` (e.g., `/opt/ai` if binary is `/opt/ai/bin/ai`).
+fn install_prefix() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let mut p = exe.as_path();
+    loop {
+        p = p.parent()?;
+        if p.join("bin").join("ai").exists() {
+            return Some(p.to_path_buf());
+        }
+        p.parent()?;
+    }
+}
+
+/// Returns config search paths in priority order (lowest to highest):
+/// 1. /etc/ai/config.toml (system-wide)
+/// 2. <install_prefix>/etc/ai/config.toml (conda env / module install)
+/// 3. ~/.config/ai/config.toml (per-user)
+fn config_search_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from("/etc/ai/config.toml")];
+    if let Some(prefix) = install_prefix() {
+        paths.push(prefix.join("etc").join("ai").join("config.toml"));
+    }
+    if let Some(cfg_dir) = dirs::config_dir() {
+        paths.push(cfg_dir.join("ai").join("config.toml"));
+    }
+    paths
+}
+
+/// Legacy helper for error messages — returns the user config path.
+fn user_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ai")
@@ -55,27 +85,41 @@ fn config_file_path() -> PathBuf {
 }
 
 fn load_config() -> Config {
-    let path = config_file_path();
-    let file_cfg: ConfigFile = if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_default(),
-            Err(_) => ConfigFile::default(),
-        }
-    } else {
-        ConfigFile::default()
-    };
+    let mut merged = ConfigFile::default();
 
-    let api_key = std::env::var("AI_API_KEY").ok().or(file_cfg.api_key);
+    // Merge config files in priority order (lowest to highest)
+    for path in config_search_paths() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(c) = toml::from_str::<ConfigFile>(&text) {
+                if c.api_key.is_some() {
+                    merged.api_key = c.api_key;
+                }
+                if c.base_url.is_some() {
+                    merged.base_url = c.base_url;
+                }
+                if c.model.is_some() {
+                    merged.model = c.model;
+                }
+            }
+        }
+    }
+
+    // Environment variables have highest priority
+    let api_key = std::env::var("AI_API_KEY").ok().or(merged.api_key);
     let base_url = std::env::var("AI_BASE_URL")
         .ok()
-        .or(file_cfg.base_url)
+        .or(merged.base_url)
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
     let model = std::env::var("AI_MODEL")
         .ok()
-        .or(file_cfg.model)
+        .or(merged.model)
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-    Config { api_key, base_url, model }
+    Config {
+        api_key,
+        base_url,
+        model,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -115,37 +159,64 @@ struct ResponseMessage {
 // API call
 // ---------------------------------------------------------------------------
 
+/// Check if the URL points to a local proxy (127.0.0.1 or localhost).
+fn is_local_proxy(base_url: &str) -> bool {
+    base_url.starts_with("http://127.0.0.1") || base_url.starts_with("http://localhost")
+}
+
+/// Check if the URL is the OpenAI API (requires an API key).
+fn is_openai_url(base_url: &str) -> bool {
+    base_url.starts_with(DEFAULT_BASE_URL) || base_url.starts_with("https://api.openai.com")
+}
+
 fn fetch_command(config: &Config, prompt: &str) -> Result<String, String> {
-    let api_key = config.api_key.as_deref().ok_or_else(|| {
-        format!(
+    // API key is required only for OpenAI URLs; local proxies don't need one
+    if config.api_key.is_none() && is_openai_url(&config.base_url) {
+        return Err(format!(
             "API key not set. Add api_key to {} or set AI_API_KEY.",
-            config_file_path().display()
-        )
-    })?;
+            user_config_path().display()
+        ));
+    }
 
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
 
     let body = ChatRequest {
         model: config.model.clone(),
         messages: vec![
-            Message { role: "system", content: SYSTEM_PROMPT.to_string() },
-            Message { role: "user", content: prompt.to_string() },
+            Message {
+                role: "system",
+                content: SYSTEM_PROMPT.to_string(),
+            },
+            Message {
+                role: "user",
+                content: prompt.to_string(),
+            },
         ],
         temperature: 0.0,
         max_tokens: 500,
     };
 
-    let response = match ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", api_key))
-        .set("Content-Type", "application/json")
-        .send_json(&body)
-    {
+    // Build request, conditionally adding Authorization header
+    let mut req = ureq::post(&url).set("Content-Type", "application/json");
+    if let Some(ref key) = config.api_key {
+        req = req.set("Authorization", &format!("Bearer {}", key));
+    }
+
+    let response = match req.send_json(&body) {
         Ok(r) => r,
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
             return Err(format!("API error {}: {}", code, body));
         }
         Err(ureq::Error::Transport(e)) => {
+            if is_local_proxy(&config.base_url) {
+                return Err(format!(
+                    "Cannot reach the hpc-job-analyst proxy at {}.\n\
+                     Check that the proxy service is running:\n\
+                     \n    analyze-job proxy status",
+                    config.base_url
+                ));
+            }
             return Err(format!("Connection failed: {}", e));
         }
     };
@@ -204,7 +275,10 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             if try_cli_clipboard(text) {
                 Ok(())
             } else {
-                Err(format!("arboard: {}; no fallback tool found (xclip/xsel/wl-copy)", arboard_err))
+                Err(format!(
+                    "arboard: {}; no fallback tool found (xclip/xsel/wl-copy)",
+                    arboard_err
+                ))
             }
         }
     }
@@ -335,7 +409,8 @@ mod tests {
 
         #[test]
         fn chat_response_multiple_choices() {
-            let json = r#"{"choices":[{"message":{"content":"ls -la"}},{"message":{"content":"dir"}}]}"#;
+            let json =
+                r#"{"choices":[{"message":{"content":"ls -la"}},{"message":{"content":"dir"}}]}"#;
             let resp: ChatResponse = serde_json::from_str(json).unwrap();
             assert_eq!(resp.choices.len(), 2);
             assert_eq!(resp.choices[0].message.content, "ls -la");
@@ -363,7 +438,8 @@ mod tests {
 
         #[test]
         fn config_file_all_fields() {
-            let toml = "api_key = \"sk-abc\"\nbase_url = \"https://custom.io/v1\"\nmodel = \"gpt-4\"";
+            let toml =
+                "api_key = \"sk-abc\"\nbase_url = \"https://custom.io/v1\"\nmodel = \"gpt-4\"";
             let cfg: ConfigFile = toml::from_str(toml).unwrap();
             assert_eq!(cfg.api_key.as_deref(), Some("sk-abc"));
             assert_eq!(cfg.base_url.as_deref(), Some("https://custom.io/v1"));
@@ -397,8 +473,14 @@ mod tests {
             let req = ChatRequest {
                 model: "gpt-4o-mini".to_string(),
                 messages: vec![
-                    Message { role: "system", content: "sys".to_string() },
-                    Message { role: "user", content: "hello".to_string() },
+                    Message {
+                        role: "system",
+                        content: "sys".to_string(),
+                    },
+                    Message {
+                        role: "user",
+                        content: "hello".to_string(),
+                    },
                 ],
                 temperature: 0.0,
                 max_tokens: 500,
@@ -454,7 +536,10 @@ mod tests {
                 .with_header("content-type", "application/json")
                 .with_body(ok_body("ls -la"))
                 .create();
-            assert_eq!(fetch_command(&test_config(&server.url()), "list files"), Ok("ls -la".to_string()));
+            assert_eq!(
+                fetch_command(&test_config(&server.url()), "list files"),
+                Ok("ls -la".to_string())
+            );
         }
 
         #[test]
@@ -466,7 +551,10 @@ mod tests {
                 .with_header("content-type", "application/json")
                 .with_body(ok_body("```bash\nls -la\n```"))
                 .create();
-            assert_eq!(fetch_command(&test_config(&server.url()), "list files"), Ok("ls -la".to_string()));
+            assert_eq!(
+                fetch_command(&test_config(&server.url()), "list files"),
+                Ok("ls -la".to_string())
+            );
         }
 
         #[test]
@@ -553,7 +641,9 @@ mod tests {
             let mut server = mockito::Server::new();
             let _mock = server
                 .mock("POST", "/chat/completions")
-                .match_body(mockito::Matcher::Regex(r#""model"\s*:\s*"custom-model""#.to_string()))
+                .match_body(mockito::Matcher::Regex(
+                    r#""model"\s*:\s*"custom-model""#.to_string(),
+                ))
                 .with_status(200)
                 .with_header("content-type", "application/json")
                 .with_body(ok_body("ls -la"))
@@ -651,6 +741,261 @@ mod tests {
             assert_eq!(config.model, "gpt-all");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Group 5: config_search_paths — path discovery logic
+    // -----------------------------------------------------------------------
+    mod config_search_paths_tests {
+        use super::*;
+
+        #[test]
+        fn returns_at_least_two_paths() {
+            let paths = config_search_paths();
+            // At minimum: /etc/ai/config.toml and user config
+            assert!(
+                paths.len() >= 2,
+                "expected at least 2 paths, got {}",
+                paths.len()
+            );
+        }
+
+        #[test]
+        fn first_path_is_etc() {
+            let paths = config_search_paths();
+            assert_eq!(paths[0], PathBuf::from("/etc/ai/config.toml"));
+        }
+
+        #[test]
+        fn last_path_is_user_config() {
+            let paths = config_search_paths();
+            let last = paths.last().unwrap();
+            // Should end with ai/config.toml
+            assert!(
+                last.ends_with("ai/config.toml"),
+                "unexpected last path: {:?}",
+                last
+            );
+            // Should NOT be /etc
+            assert!(
+                !last.starts_with("/etc"),
+                "last path should be user config, not /etc"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 6: is_local_proxy and is_openai_url — helper functions
+    // -----------------------------------------------------------------------
+    mod url_helper_tests {
+        use super::*;
+
+        #[test]
+        fn is_local_proxy_127() {
+            assert!(is_local_proxy("http://127.0.0.1:8742/api/v1"));
+            assert!(is_local_proxy("http://127.0.0.1/api"));
+        }
+
+        #[test]
+        fn is_local_proxy_localhost() {
+            assert!(is_local_proxy("http://localhost:8742/api/v1"));
+            assert!(is_local_proxy("http://localhost/api"));
+        }
+
+        #[test]
+        fn is_local_proxy_false_for_remote() {
+            assert!(!is_local_proxy("https://api.openai.com/v1"));
+            assert!(!is_local_proxy("http://example.com/api"));
+        }
+
+        #[test]
+        fn is_openai_url_default() {
+            assert!(is_openai_url(DEFAULT_BASE_URL));
+        }
+
+        #[test]
+        fn is_openai_url_variants() {
+            assert!(is_openai_url("https://api.openai.com/v1"));
+            assert!(is_openai_url("https://api.openai.com/v2"));
+        }
+
+        #[test]
+        fn is_openai_url_false_for_others() {
+            assert!(!is_openai_url("http://127.0.0.1:8742/api/v1"));
+            assert!(!is_openai_url("https://api.anthropic.com/v1"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 7: layered config merge — uses tempfile
+    // -----------------------------------------------------------------------
+    mod layered_config_tests {
+        use super::*;
+
+        /// Helper to merge config files without environment variable interference.
+        /// Takes a list of (path, content) tuples and returns the merged ConfigFile.
+        fn merge_config_files(files: &[(PathBuf, &str)]) -> ConfigFile {
+            let mut merged = ConfigFile::default();
+            for (path, content) in files {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, content).unwrap();
+            }
+            // Now read them back in order
+            for (path, _) in files {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(c) = toml::from_str::<ConfigFile>(&text) {
+                        if c.api_key.is_some() {
+                            merged.api_key = c.api_key;
+                        }
+                        if c.base_url.is_some() {
+                            merged.base_url = c.base_url;
+                        }
+                        if c.model.is_some() {
+                            merged.model = c.model;
+                        }
+                    }
+                }
+            }
+            merged
+        }
+
+        #[test]
+        fn higher_priority_overwrites_lower() {
+            let dir = tempfile::tempdir().unwrap();
+            let low = dir.path().join("low").join("config.toml");
+            let high = dir.path().join("high").join("config.toml");
+
+            let merged = merge_config_files(&[
+                (low, "model = \"low-model\"\nbase_url = \"http://low.io\""),
+                (high, "model = \"high-model\""),
+            ]);
+
+            assert_eq!(merged.model.as_deref(), Some("high-model"));
+            assert_eq!(merged.base_url.as_deref(), Some("http://low.io")); // not overwritten
+        }
+
+        #[test]
+        fn missing_file_is_skipped() {
+            let dir = tempfile::tempdir().unwrap();
+            let existing = dir.path().join("exists").join("config.toml");
+            let missing = dir.path().join("missing").join("config.toml");
+
+            // Only create the existing file
+            std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+            std::fs::write(&existing, "model = \"exists-model\"").unwrap();
+
+            let mut merged = ConfigFile::default();
+            for path in [&missing, &existing] {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(c) = toml::from_str::<ConfigFile>(&text) {
+                        if c.model.is_some() {
+                            merged.model = c.model;
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(merged.model.as_deref(), Some("exists-model"));
+        }
+
+        #[test]
+        fn partial_configs_merge_correctly() {
+            let dir = tempfile::tempdir().unwrap();
+            let f1 = dir.path().join("f1").join("config.toml");
+            let f2 = dir.path().join("f2").join("config.toml");
+            let f3 = dir.path().join("f3").join("config.toml");
+
+            let merged = merge_config_files(&[
+                (f1, "api_key = \"key1\""),
+                (f2, "base_url = \"http://url2.io\""),
+                (f3, "model = \"model3\""),
+            ]);
+
+            assert_eq!(merged.api_key.as_deref(), Some("key1"));
+            assert_eq!(merged.base_url.as_deref(), Some("http://url2.io"));
+            assert_eq!(merged.model.as_deref(), Some("model3"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group 8: optional api_key tests
+    // -----------------------------------------------------------------------
+    mod optional_api_key_tests {
+        use super::*;
+
+        fn config_without_key(base_url: &str) -> Config {
+            Config {
+                api_key: None,
+                base_url: base_url.to_string(),
+                model: "test-model".to_string(),
+            }
+        }
+
+        fn ok_body(content: &str) -> String {
+            serde_json::json!({
+                "choices": [{"message": {"content": content}}]
+            })
+            .to_string()
+        }
+
+        #[test]
+        fn missing_api_key_non_openai_succeeds() {
+            let mut server = mockito::Server::new();
+            let _mock = server
+                .mock("POST", "/chat/completions")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(ok_body("ls -la"))
+                .create();
+
+            // Mock server URL is http://127.0.0.1:PORT, which is NOT openai
+            let config = config_without_key(&server.url());
+            let result = fetch_command(&config, "list files");
+            assert!(result.is_ok(), "expected success, got: {:?}", result);
+        }
+
+        #[test]
+        fn missing_api_key_openai_url_returns_err() {
+            let config = config_without_key(DEFAULT_BASE_URL);
+            let err = fetch_command(&config, "list files").unwrap_err();
+            assert!(err.contains("API key not set"), "got: {err}");
+        }
+
+        #[test]
+        fn no_auth_header_when_key_missing() {
+            let mut server = mockito::Server::new();
+            let _mock = server
+                .mock("POST", "/chat/completions")
+                // Explicitly expect NO authorization header
+                .match_header("authorization", mockito::Matcher::Missing)
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(ok_body("ls -la"))
+                .create();
+
+            let config = config_without_key(&server.url());
+            let result = fetch_command(&config, "list files");
+            assert!(result.is_ok(), "expected success, got: {:?}", result);
+        }
+
+        #[test]
+        fn local_proxy_connection_error_shows_friendly_message() {
+            // Use a port that's definitely not listening
+            let config = Config {
+                api_key: None,
+                base_url: "http://127.0.0.1:59999/api/v1".to_string(),
+                model: "test-model".to_string(),
+            };
+            let err = fetch_command(&config, "list files").unwrap_err();
+            assert!(
+                err.contains("hpc-job-analyst proxy"),
+                "expected friendly message, got: {err}"
+            );
+            assert!(
+                err.contains("analyze-job proxy status"),
+                "expected hint, got: {err}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -662,13 +1007,22 @@ fn main() {
     let config = load_config();
 
     if args.config {
-        let path = config_file_path();
-        println!("Config file : {}", path.display());
-        println!("base_url    : {}", config.base_url);
-        println!("model       : {}", config.model);
+        println!("Config search paths (lowest -> highest priority):");
+        for path in config_search_paths() {
+            let status = if path.exists() { "found" } else { "not found" };
+            println!("  {}  ({})", path.display(), status);
+        }
+        println!();
+        println!("Active values:");
+        println!("  base_url  : {}", config.base_url);
+        println!("  model     : {}", config.model);
         println!(
-            "api_key     : {}",
-            if config.api_key.is_some() { "(set)" } else { "(not set)" }
+            "  api_key   : {}",
+            if config.api_key.is_some() {
+                "(set)"
+            } else {
+                "(not set)"
+            }
         );
         return;
     }

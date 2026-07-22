@@ -41,8 +41,12 @@ Configuration is resolved in this order (later sources override earlier ones):
 
 | Source | Location |
 |--------|----------|
-| Config file | macOS: `~/Library/Application Support/ai/config.toml`<br>Linux: `~/.config/ai/config.toml` |
+| System config | `/etc/ai/config.toml` |
+| Install prefix config | `<install_prefix>/etc/ai/config.toml` (e.g., conda env or module install) |
+| User config | macOS: `~/Library/Application Support/ai/config.toml`<br>Linux: `~/.config/ai/config.toml` |
 | Environment variables | `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` |
+
+The install prefix is auto-detected by walking up from the binary's location.
 
 ### Config file
 
@@ -74,6 +78,29 @@ Any OpenAI-compatible API works. For example, to use a local [Ollama](https://ol
 export AI_BASE_URL="http://localhost:11434/v1"
 export AI_MODEL="llama3"
 export AI_API_KEY="ollama"   # required by the client; value is ignored by Ollama
+```
+
+### NOAA HPC systems (hpc-job-analyst proxy)
+
+On NOAA HPC login nodes where the `hpc-job-analyst` proxy is running,
+no API key is needed. Load the module and use the tool directly:
+
+```bash
+module load ai
+ai list all files modified in the last 24 hours
+```
+
+The tool is pre-configured to use the local proxy on `127.0.0.1:8742`.
+To verify your configuration:
+
+```bash
+ai --config
+```
+
+If the proxy is not reachable, check its status with:
+
+```bash
+analyze-job proxy status
 ```
 
 ## Clipboard support
