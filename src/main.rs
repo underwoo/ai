@@ -22,8 +22,16 @@ const SYSTEM_PROMPT: &str =
 )]
 struct Args {
     /// Print active configuration and exit
-    #[arg(short, long)]
-    config: bool,
+    #[arg(long)]
+    print_config: bool,
+
+    /// Use a custom config file (merged with other config sources)
+    #[arg(short = 'c', long = "config", value_name = "FILE")]
+    config_file: Option<PathBuf>,
+
+    /// Increase output verbosity (-v, -vv, -vvv)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     /// Natural-language description of what you want to do
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -41,10 +49,18 @@ struct ConfigFile {
     model: Option<String>,
 }
 
+#[derive(Debug)]
 struct Config {
     api_key: Option<String>,
     base_url: String,
     model: String,
+}
+
+/// Result of loading configuration, includes which files were loaded.
+#[derive(Debug)]
+struct ConfigResult {
+    config: Config,
+    loaded_paths: Vec<PathBuf>,
 }
 
 /// Detect the install prefix by walking up from the binary's location.
@@ -84,8 +100,21 @@ fn user_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-fn load_config() -> Config {
+/// Load and validate a custom config file specified via -c/--config.
+/// Returns an error if the file doesn't exist or contains invalid TOML.
+fn load_custom_config(path: &PathBuf) -> Result<ConfigFile, String> {
+    if !path.exists() {
+        return Err(format!("Config file not found: {}", path.display()));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
+    toml::from_str(&text)
+        .map_err(|e| format!("Invalid TOML in config file {}: {}", path.display(), e))
+}
+
+fn load_config(custom_config: Option<&PathBuf>) -> Result<ConfigResult, String> {
     let mut merged = ConfigFile::default();
+    let mut loaded_paths = Vec::new();
 
     // Merge config files in priority order (lowest to highest)
     for path in config_search_paths() {
@@ -100,8 +129,24 @@ fn load_config() -> Config {
                 if c.model.is_some() {
                     merged.model = c.model;
                 }
+                loaded_paths.push(path);
             }
         }
+    }
+
+    // Custom config file has higher priority than standard paths
+    if let Some(custom_path) = custom_config {
+        let c = load_custom_config(custom_path)?;
+        if c.api_key.is_some() {
+            merged.api_key = c.api_key;
+        }
+        if c.base_url.is_some() {
+            merged.base_url = c.base_url;
+        }
+        if c.model.is_some() {
+            merged.model = c.model;
+        }
+        loaded_paths.push(custom_path.clone());
     }
 
     // Environment variables have highest priority
@@ -115,11 +160,14 @@ fn load_config() -> Config {
         .or(merged.model)
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
-    Config {
-        api_key,
-        base_url,
-        model,
-    }
+    Ok(ConfigResult {
+        config: Config {
+            api_key,
+            base_url,
+            model,
+        },
+        loaded_paths,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -691,10 +739,10 @@ mod tests {
         #[ignore]
         fn defaults_when_nothing_set() {
             clear_ai_env();
-            let config = load_config();
-            assert!(config.api_key.is_none());
-            assert_eq!(config.base_url, DEFAULT_BASE_URL);
-            assert_eq!(config.model, DEFAULT_MODEL);
+            let result = load_config(None).unwrap();
+            assert!(result.config.api_key.is_none());
+            assert_eq!(result.config.base_url, DEFAULT_BASE_URL);
+            assert_eq!(result.config.model, DEFAULT_MODEL);
         }
 
         #[test]
@@ -702,9 +750,9 @@ mod tests {
         fn env_api_key_is_used() {
             clear_ai_env();
             std::env::set_var("AI_API_KEY", "sk-env");
-            let config = load_config();
+            let result = load_config(None).unwrap();
             clear_ai_env();
-            assert_eq!(config.api_key.as_deref(), Some("sk-env"));
+            assert_eq!(result.config.api_key.as_deref(), Some("sk-env"));
         }
 
         #[test]
@@ -712,9 +760,9 @@ mod tests {
         fn env_base_url_overrides() {
             clear_ai_env();
             std::env::set_var("AI_BASE_URL", "https://custom.io/v1");
-            let config = load_config();
+            let result = load_config(None).unwrap();
             clear_ai_env();
-            assert_eq!(config.base_url, "https://custom.io/v1");
+            assert_eq!(result.config.base_url, "https://custom.io/v1");
         }
 
         #[test]
@@ -722,9 +770,9 @@ mod tests {
         fn env_model_overrides() {
             clear_ai_env();
             std::env::set_var("AI_MODEL", "gpt-4");
-            let config = load_config();
+            let result = load_config(None).unwrap();
             clear_ai_env();
-            assert_eq!(config.model, "gpt-4");
+            assert_eq!(result.config.model, "gpt-4");
         }
 
         #[test]
@@ -734,11 +782,11 @@ mod tests {
             std::env::set_var("AI_API_KEY", "sk-all");
             std::env::set_var("AI_BASE_URL", "https://all.io/v1");
             std::env::set_var("AI_MODEL", "gpt-all");
-            let config = load_config();
+            let result = load_config(None).unwrap();
             clear_ai_env();
-            assert_eq!(config.api_key.as_deref(), Some("sk-all"));
-            assert_eq!(config.base_url, "https://all.io/v1");
-            assert_eq!(config.model, "gpt-all");
+            assert_eq!(result.config.api_key.as_deref(), Some("sk-all"));
+            assert_eq!(result.config.base_url, "https://all.io/v1");
+            assert_eq!(result.config.model, "gpt-all");
         }
     }
 
@@ -830,6 +878,7 @@ mod tests {
     // -----------------------------------------------------------------------
     mod layered_config_tests {
         use super::*;
+        use serial_test::serial;
 
         /// Helper to merge config files without environment variable interference.
         /// Takes a list of (path, content) tuples and returns the merged ConfigFile.
@@ -913,6 +962,42 @@ mod tests {
             assert_eq!(merged.api_key.as_deref(), Some("key1"));
             assert_eq!(merged.base_url.as_deref(), Some("http://url2.io"));
             assert_eq!(merged.model.as_deref(), Some("model3"));
+        }
+
+        #[test]
+        #[serial]
+        fn custom_config_file_is_loaded() {
+            // Clear env vars to avoid interference
+            std::env::remove_var("AI_API_KEY");
+            std::env::remove_var("AI_BASE_URL");
+            std::env::remove_var("AI_MODEL");
+
+            let dir = tempfile::tempdir().unwrap();
+            let custom = dir.path().join("custom.toml");
+            std::fs::write(&custom, "model = \"custom-model\"").unwrap();
+
+            let result = load_config(Some(&custom)).unwrap();
+            assert_eq!(result.config.model, "custom-model");
+            assert!(result.loaded_paths.contains(&custom));
+        }
+
+        #[test]
+        fn custom_config_missing_file_returns_error() {
+            let missing = PathBuf::from("/nonexistent/path/config.toml");
+            let result = load_config(Some(&missing));
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("Config file not found"));
+        }
+
+        #[test]
+        fn custom_config_invalid_toml_returns_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let bad = dir.path().join("bad.toml");
+            std::fs::write(&bad, "this is not valid toml [[[").unwrap();
+
+            let result = load_config(Some(&bad));
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("Invalid TOML"));
         }
     }
 
@@ -1004,13 +1089,38 @@ mod tests {
 
 fn main() {
     let args = Args::parse();
-    let config = load_config();
 
-    if args.config {
+    // Load configuration, handling custom config file errors
+    let config_result = match load_config(args.config_file.as_ref()) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
+    let config = config_result.config;
+    let loaded_paths = config_result.loaded_paths;
+
+    // Verbosity level 2+: show which config files were loaded
+    if args.verbose >= 2 {
+        if loaded_paths.is_empty() {
+            eprintln!("note: no config files loaded");
+        } else {
+            for path in &loaded_paths {
+                eprintln!("note: loaded config from {}", path.display());
+            }
+        }
+    }
+
+    // --print-config: show configuration and exit
+    if args.print_config {
         println!("Config search paths (lowest -> highest priority):");
         for path in config_search_paths() {
             let status = if path.exists() { "found" } else { "not found" };
             println!("  {}  ({})", path.display(), status);
+        }
+        if let Some(ref custom) = args.config_file {
+            println!("  {}  (custom via -c)", custom.display());
         }
         println!();
         println!("Active values:");
@@ -1027,13 +1137,35 @@ fn main() {
         return;
     }
 
+    // Verbosity level 3+: show full config dump (similar to --print-config but to stderr)
+    if args.verbose >= 3 {
+        eprintln!("debug: base_url = {}", config.base_url);
+        eprintln!("debug: model = {}", config.model);
+        eprintln!(
+            "debug: api_key = {}",
+            if config.api_key.is_some() {
+                "(set)"
+            } else {
+                "(not set)"
+            }
+        );
+    }
+
     if args.prompt.is_empty() {
         eprintln!("error: provide a description of what you want to do.");
-        eprintln!("Usage: ai <description...>");
+        eprintln!("Usage: ai [OPTIONS] <description...>");
         process::exit(1);
     }
 
     let prompt = args.prompt.join(" ");
+
+    // Verbosity level 3+: show request details
+    if args.verbose >= 3 {
+        eprintln!(
+            "debug: POST {}/chat/completions",
+            config.base_url.trim_end_matches('/')
+        );
+    }
 
     match fetch_command(&config, &prompt) {
         Err(e) => {
@@ -1043,7 +1175,13 @@ fn main() {
         Ok(cmd) => {
             println!("{}", cmd);
             if let Err(e) = copy_to_clipboard(&cmd) {
-                eprintln!("warning: clipboard unavailable: {}", e);
+                // Tiered clipboard error output based on verbosity
+                match args.verbose {
+                    0 => {} // Silent
+                    1 => eprintln!("note: clipboard unavailable"),
+                    2 => eprintln!("note: clipboard unavailable"),
+                    _ => eprintln!("note: clipboard unavailable: {}", e),
+                }
             }
         }
     }

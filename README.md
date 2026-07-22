@@ -44,6 +44,7 @@ Configuration is resolved in this order (later sources override earlier ones):
 | System config | `/etc/ai/config.toml` |
 | Install prefix config | `<install_prefix>/etc/ai/config.toml` (e.g., conda env or module install) |
 | User config | macOS: `~/Library/Application Support/ai/config.toml`<br>Linux: `~/.config/ai/config.toml` |
+| Custom config | File specified via `-c/--config <FILE>` |
 | Environment variables | `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL` |
 
 The install prefix is auto-detected by walking up from the binary's location.
@@ -67,8 +68,32 @@ model    = "gpt-4o-mini"                 # optional; this is the default
 ### Inspect active configuration
 
 ```bash
-ai --config
+ai --print-config
 ```
+
+### Use a custom config file
+
+```bash
+ai -c /path/to/config.toml list files
+ai --config /path/to/config.toml list files
+```
+
+## Command-line Options
+
+| Option | Description |
+|--------|-------------|
+| `-c, --config <FILE>` | Use a custom config file (merged with other config sources) |
+| `--print-config` | Print active configuration and exit |
+| `-v, --verbose` | Increase output verbosity (can be repeated) |
+
+### Verbosity levels
+
+| Level | Effect |
+|-------|--------|
+| (default) | Errors only; clipboard failures are silent |
+| `-v` | Show note when clipboard is unavailable |
+| `-vv` | Also show which config files were loaded |
+| `-vvv` | Full debug output including config values and API request details |
 
 ## Using an alternative LLM provider
 
@@ -94,7 +119,7 @@ The tool is pre-configured to use the local proxy on `127.0.0.1:8742`.
 To verify your configuration:
 
 ```bash
-ai --config
+ai --print-config
 ```
 
 If the proxy is not reachable, check its status with:
@@ -110,7 +135,7 @@ The generated command is automatically copied to the clipboard:
 - **macOS** — uses the native clipboard via the `arboard` library.
 - **Linux (X11/Wayland)** — tries `arboard` first, then falls back to `wl-copy`, `xclip`, or `xsel` if available.
 
-If no clipboard mechanism is found, the command is still printed to stdout and a warning is displayed.
+If no clipboard mechanism is found, the command is still printed to stdout. Use `-v` to see a note when the clipboard is unavailable, or `-vvv` for full error details.
 
 ## Building from source
 
